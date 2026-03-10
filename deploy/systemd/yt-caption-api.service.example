@@ -1,0 +1,16 @@
+[Unit]
+Description=YT Caption API
+After=network.target
+
+[Service]
+# Change the username, home directory, project directory, and binary paths for your machine.
+Type=simple
+User=user
+WorkingDirectory=/home/user/yt-caption-api
+Environment=PATH=/home/user/.nvm/versions/node/v22.19.0/bin/node:/home/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/home/user/.local/bin/uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
