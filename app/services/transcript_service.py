@@ -158,6 +158,14 @@ class TranscriptService:
         query = parse_qs(urlparse(track_url).query)
         return (query.get("tlang", [lang])[0] or lang).lower()
 
+    @staticmethod
+    def _get_native_language(info: dict[str, Any]) -> str | None:
+        for key in ("language", "original_language"):
+            value = info.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.lower()
+        return None
+
     def _pick_caption_tracks(
             self,
             info: dict[str, Any],
@@ -166,6 +174,8 @@ class TranscriptService:
     ) -> list[tuple[str, dict[str, Any], str]]:
         subtitles = info.get("subtitles") or {}
         automatic_captions = info.get("automatic_captions") or {}
+        native_language = self._get_native_language(info)
+
         sources: list[tuple[str, dict[str, Any], str]] = []
 
         for lang, tracks in subtitles.items():
@@ -183,59 +193,58 @@ class TranscriptService:
             raise HTTPException(status_code=404, detail="No captions found for this video")
 
         def is_translated_track(track: dict[str, Any]) -> bool:
-            return self._effective_track_language("", track) != (
-                    parse_qs(urlparse(track.get("url") or "").query).get("lang", [""])[0] or "").lower()
+            track_url = track.get("url") or ""
+            query = parse_qs(urlparse(track_url).query)
+            lang = (query.get("lang", [""])[0] or "").lower()
+            tlang = (query.get("tlang", [""])[0] or "").lower()
+            return bool(tlang) and tlang != lang
 
-        def match_priority(item: tuple[str, dict[str, Any], str], normalized: str) -> int:
-            language_code = self._effective_track_language(item[0], item[1])
-            requested_prefix = normalized.split("-")[0]
-            language_prefix = language_code.split("-")[0]
-            translated = is_translated_track(item[1])
+        # Hard reject translated tracks completely
+        sources = [item for item in sources if not is_translated_track(item[1])]
 
-            if language_code == normalized and not translated:
-                return 0
-            if language_prefix == requested_prefix and not translated:
-                return 1
-            if language_code == normalized and translated:
-                return 2
-            if language_prefix == requested_prefix and translated:
-                return 3
+        if not sources:
+            raise HTTPException(status_code=404, detail="No non-translated captions found for this video")
+
+        normalized_preferred = preferred_language.lower() if preferred_language else None
+        preferred_prefix = normalized_preferred.split("-")[0] if normalized_preferred else None
+        native_prefix = native_language.split("-")[0] if native_language else None
+
+        normalized_sources = [
+            (self._effective_track_language(lang, track), track, source)
+            for lang, track, source in sources
+        ]
+
+        def language_rank(track_language: str) -> int:
+            track_prefix = track_language.split("-")[0]
+
+            # 1) requested language
+            if normalized_preferred:
+                if track_language == normalized_preferred:
+                    return 0
+                if track_prefix == preferred_prefix:
+                    return 1
+
+            # 2) native/original language
+            if native_language:
+                if track_language == native_language:
+                    return 2
+                if track_prefix == native_prefix:
+                    return 3
+
+            # 3) any other non-translated language
             return 4
 
-        def sort_key(
-                item: tuple[str, dict[str, Any], str],
-                normalized: str | None = None,
-        ) -> tuple[int, int, int, int]:
-            _, track, source = item
-            extension_priority = TRACK_EXTENSION_PRIORITY.get(track.get("ext"), 99)
-            translated_priority = 1 if is_translated_track(track) else 0
+        def sort_key(item: tuple[str, dict[str, Any], str]) -> tuple[int, int, int]:
+            lang, track, source = item
             source_priority = 0 if source == "subtitles" else 1
-            language_priority = 0 if normalized is None else match_priority(item, normalized)
-            return language_priority, translated_priority, source_priority, extension_priority
+            extension_priority = TRACK_EXTENSION_PRIORITY.get(track.get("ext"), 99)
+            return (
+                language_rank(lang),
+                source_priority,
+                extension_priority,
+            )
 
-        if preferred_language:
-            normalized = preferred_language.lower()
-            matching_sources = [
-                item
-                for item in sources
-                if self._effective_track_language(item[0], item[1]).split("-")[0] == normalized.split("-")[0]
-            ]
-            if matching_sources:
-                return sorted(
-                    [
-                        (self._effective_track_language(lang, track), track, source)
-                        for lang, track, source in matching_sources
-                    ],
-                    key=lambda item: sort_key((item[0], item[1], item[2]), normalized),
-                )
-
-        return sorted(
-            [
-                (self._effective_track_language(lang, track), track, source)
-                for lang, track, source in sources
-            ],
-            key=lambda item: sort_key((item[0], item[1], item[2])),
-        )
+        return sorted(normalized_sources, key=sort_key)
 
     def _parse_json3_events(self, payload: dict[str, Any]) -> str:
         parts: list[str] = []
