@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import html
 import json
 import re
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
@@ -44,34 +45,43 @@ class TranscriptService:
         resolved_url = self._resolve_url(self._build_video_url(video_id))
         info = self._extract_video_info(resolved_url)
 
-        selected_language, track, source = self._pick_caption_track(
+        candidates = self._pick_caption_tracks(
             info=info,
             preferred_language=language,
             include_auto=include_auto,
         )
+        last_error: HTTPException | None = None
 
-        track_url = track.get("url")
-        extension = track.get("ext") or ""
-        if not track_url:
-            raise HTTPException(status_code=404, detail="Caption track URL missing")
+        for selected_language, track, source in candidates:
+            track_url = track.get("url")
+            extension = track.get("ext") or ""
+            if not track_url:
+                last_error = HTTPException(status_code=404, detail="Caption track URL missing")
+                continue
 
-        try:
-            text = self._fetch_caption_text(track_url, extension)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Failed to fetch captions: {exc}") from exc
+            try:
+                text = self._fetch_caption_text(track_url, extension)
+            except HTTPException as exc:
+                last_error = exc
+                continue
 
-        payload = {
-            "id": info.get("id"),
-            "title": info.get("title"),
-            "uploader": info.get("uploader"),
-            "webpage_url": info.get("webpage_url") or resolved_url,
-            "language": selected_language,
-            "source": source,
-            "extension": extension,
-            "transcript": text,
-        }
-        self.cache_service.save(video_id, language, include_auto, payload)
-        return payload, "MISS"
+            payload = {
+                "id": info.get("id"),
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "webpage_url": info.get("webpage_url") or resolved_url,
+                "language": selected_language,
+                "source": source,
+                "extension": extension,
+                "transcript": text,
+            }
+            self.cache_service.save(video_id, language, include_auto, payload)
+            return payload, "MISS"
+
+        if last_error is not None:
+            raise last_error
+
+        raise HTTPException(status_code=404, detail="No usable captions found for this video")
 
     def shape_response(
         self,
@@ -135,19 +145,33 @@ class TranscriptService:
         )
         if completed.returncode != 0:
             message = completed.stderr.strip() or completed.stdout.strip() or "Unknown yt-dlp error"
-            raise HTTPException(status_code=400, detail=f"yt-dlp failed: {message}")
+            lowered = message.lower()
+            if "too many requests" in lowered or "429" in lowered:
+                status_code = 429
+            elif "forbidden" in lowered or "sign in" in lowered or "login" in lowered:
+                status_code = 403
+            elif "not available" in lowered or "unavailable" in lowered:
+                status_code = 404
+            else:
+                status_code = 502
+            raise HTTPException(status_code=status_code, detail=f"yt-dlp failed: {message}")
 
         try:
             return json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="yt-dlp returned invalid JSON") from exc
+            raise HTTPException(status_code=502, detail="yt-dlp returned invalid JSON") from exc
 
-    def _pick_caption_track(
+    def _effective_track_language(self, lang: str, track: dict[str, Any]) -> str:
+        track_url = track.get("url") or ""
+        query = parse_qs(urlparse(track_url).query)
+        return (query.get("tlang", [lang])[0] or lang).lower()
+
+    def _pick_caption_tracks(
         self,
         info: dict[str, Any],
         preferred_language: str | None,
         include_auto: bool,
-    ) -> tuple[str, dict[str, Any], str]:
+    ) -> list[tuple[str, dict[str, Any], str]]:
         subtitles = info.get("subtitles") or {}
         automatic_captions = info.get("automatic_captions") or {}
         sources: list[tuple[str, dict[str, Any], str]] = []
@@ -166,42 +190,89 @@ class TranscriptService:
         if not sources:
             raise HTTPException(status_code=404, detail="No captions found for this video")
 
-        def sort_key(item: tuple[str, dict[str, Any], str]) -> tuple[int, int]:
-            lang, track, source = item
+        def is_translated_track(track: dict[str, Any]) -> bool:
+            return self._effective_track_language("", track) != (parse_qs(urlparse(track.get("url") or "").query).get("lang", [""])[0] or "").lower()
+
+        def match_priority(item: tuple[str, dict[str, Any], str], normalized: str) -> int:
+            language_code = self._effective_track_language(item[0], item[1])
+            requested_prefix = normalized.split("-")[0]
+            language_prefix = language_code.split("-")[0]
+            translated = is_translated_track(item[1])
+
+            if language_code == normalized and not translated:
+                return 0
+            if language_prefix == requested_prefix and not translated:
+                return 1
+            if language_code == normalized and translated:
+                return 2
+            if language_prefix == requested_prefix and translated:
+                return 3
+            return 4
+
+        def sort_key(
+            item: tuple[str, dict[str, Any], str],
+            normalized: str | None = None,
+        ) -> tuple[int, int, int, int]:
+            _, track, source = item
             extension_priority = TRACK_EXTENSION_PRIORITY.get(track.get("ext"), 99)
+            translated_priority = 1 if is_translated_track(track) else 0
             source_priority = 0 if source == "subtitles" else 1
-            return (source_priority, extension_priority)
+            language_priority = 0 if normalized is None else match_priority(item, normalized)
+            return language_priority, translated_priority, source_priority, extension_priority
 
         if preferred_language:
             normalized = preferred_language.lower()
-            exact_matches = [item for item in sources if item[0].lower() == normalized]
-            if exact_matches:
-                return min(exact_matches, key=sort_key)
-
-            prefix_matches = [
+            matching_sources = [
                 item
                 for item in sources
-                if item[0].lower().split("-")[0] == normalized.split("-")[0]
+                if self._effective_track_language(item[0], item[1]).split("-")[0] == normalized.split("-")[0]
             ]
-            if prefix_matches:
-                return min(prefix_matches, key=sort_key)
+            if matching_sources:
+                return sorted(
+                    [
+                        (self._effective_track_language(lang, track), track, source)
+                        for lang, track, source in matching_sources
+                    ],
+                    key=lambda item: sort_key((item[0], item[1], item[2]), normalized),
+                )
 
-        return min(sources, key=sort_key)
+        return sorted(
+            [
+                (self._effective_track_language(lang, track), track, source)
+                for lang, track, source in sources
+            ],
+            key=lambda item: sort_key((item[0], item[1], item[2])),
+        )
 
     def _parse_json3_events(self, payload: dict[str, Any]) -> str:
         parts: list[str] = []
         for event in payload.get("events", []):
             segments = event.get("segs") or []
             text = "".join(segment.get("utf8", "") for segment in segments).strip()
+            text = self._clean_caption_fragment(text)
             if text:
                 parts.append(text)
         return self._clean_transcript_text(" ".join(parts))
 
+    def _clean_caption_fragment(self, text: str) -> str:
+        text = re.sub(r"<[^>]+>", "", text)
+        return html.unescape(text).strip()
+
     def _clean_transcript_text(self, text: str) -> str:
         text = text.replace("\r", " ").replace("\n", " ")
         text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"\([^)]*\)", " ", text)
-        text = re.sub(r"(^|\s)-\s+", " ", text)
+        text = re.sub(
+            r"\[(music|applause|laughter|cheering)\]",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\((music|applause|laughter|cheering)\)",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
         text = re.sub(r"\s+([,.;:!?])", r"\1", text)
         text = re.sub(r"([(\[{])\s+", r"\1", text)
         text = re.sub(r"\s+([)\]}])", r"\1", text)
@@ -222,7 +293,9 @@ class TranscriptService:
                 continue
             if re.fullmatch(r"\d+", line):
                 continue
-            lines.append(line)
+            cleaned_line = self._clean_caption_fragment(line)
+            if cleaned_line:
+                lines.append(cleaned_line)
 
         return self._clean_transcript_text(" ".join(lines))
 
@@ -242,6 +315,10 @@ class TranscriptService:
                 impersonate=self.settings.curl_impersonate,
                 timeout=self.settings.caption_fetch_timeout_seconds,
             )
+            if response.status_code == 429:
+                raise HTTPException(status_code=429, detail="YouTube rate limited caption segment fetch")
+            if response.status_code == 403:
+                raise HTTPException(status_code=403, detail="YouTube rejected caption segment fetch")
             response.raise_for_status()
             parts.append(self._parse_vtt_text(response.text))
 
@@ -253,6 +330,12 @@ class TranscriptService:
             impersonate=self.settings.curl_impersonate,
             timeout=self.settings.caption_fetch_timeout_seconds,
         )
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="YouTube rate limited caption fetch")
+        if response.status_code == 403:
+            raise HTTPException(status_code=403, detail="YouTube rejected caption fetch")
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Caption track was unavailable")
         response.raise_for_status()
 
         if extension == "json3":
