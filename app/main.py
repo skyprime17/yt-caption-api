@@ -24,6 +24,7 @@ def create_lifespan(settings: Settings):
         if not settings.cookies_file.exists():
             raise RuntimeError(f"Missing cookies file at {settings.cookies_file}")
 
+        settings.cache_dir.mkdir(parents=True, exist_ok=True)
         cache_service = CacheService(settings)
         transcript_service = TranscriptService(settings, cache_service)
         cache_service.prune()

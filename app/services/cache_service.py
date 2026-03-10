@@ -55,8 +55,6 @@ class CacheService:
         include_auto: bool,
         payload: dict[str, Any],
     ) -> None:
-        self.prune()
-        self.settings.cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = self._cache_file(video_id, language, include_auto)
         cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 

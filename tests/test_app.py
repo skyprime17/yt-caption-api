@@ -68,6 +68,10 @@ def make_settings(tmp_path: Path, cookies_exists: bool = True) -> Settings:
     )
 
 
+def auth_headers(settings: Settings) -> dict[str, str]:
+    return {"X-AccessToken": settings.access_token}
+
+
 def test_startup_fails_without_cookies(tmp_path: Path) -> None:
     app = create_app(make_settings(tmp_path, cookies_exists=False))
     with pytest.raises(RuntimeError, match="Missing cookies file"):
@@ -76,7 +80,8 @@ def test_startup_fails_without_cookies(tmp_path: Path) -> None:
 
 
 def test_transcript_route_returns_cache_headers_and_reduced_shape(tmp_path: Path) -> None:
-    app = create_app(make_settings(tmp_path))
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
     fake_service = FakeTranscriptService()
 
     with TestClient(app) as client:
@@ -85,6 +90,7 @@ def test_transcript_route_returns_cache_headers_and_reduced_shape(tmp_path: Path
         response_one = client.get(
             "/transcript/demo123",
             params={"language": "en", "include_meta": "false", "max_chars": 5},
+            headers=auth_headers(settings),
         )
         assert response_one.status_code == 200
         assert response_one.headers["X-Cache"] == "MISS"
@@ -97,6 +103,7 @@ def test_transcript_route_returns_cache_headers_and_reduced_shape(tmp_path: Path
         response_two = client.get(
             "/transcript/demo123",
             params={"language": "en", "include_meta": "false", "max_chars": 5},
+            headers=auth_headers(settings),
         )
         assert response_two.status_code == 200
         assert response_two.headers["X-Cache"] == "HIT"
@@ -105,6 +112,7 @@ def test_transcript_route_returns_cache_headers_and_reduced_shape(tmp_path: Path
 def test_cache_service_ignores_and_prunes_expired_entries(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     settings.cache_ttl_seconds = 60
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
     cache_service = CacheService(settings)
 
     payload = {"id": "demo123", "language": "en", "transcript": "cached"}
