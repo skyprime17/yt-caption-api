@@ -32,19 +32,23 @@ Returns a basic health check.
 Example curl:
 
 ```powershell
-curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en"
+curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en" `
+  -H "X-AccessToken: 23dbce5530c211ee939900ff79794a8f"
 ```
 
 Smaller responses:
 
 ```powershell
-curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&include_meta=false"
-curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&max_chars=500"
+curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&include_meta=false" `
+  -H "X-AccessToken: 23dbce5530c211ee939900ff79794a8f"
+curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&max_chars=500" `
+  -H "X-AccessToken: 23dbce5530c211ee939900ff79794a8f"
 ```
 
 ## Notes
 
 - `cookies.txt` is expected in the project root.
+- Requests to `/transcript/...` must include `X-AccessToken`.
 - Node should be installed and available on `PATH`.
 - The API prefers normal subtitles and falls back to auto captions by default.
 - You can disable auto captions with `?include_auto=false`.

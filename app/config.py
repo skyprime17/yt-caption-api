@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     cache_dir: Path = Field(default_factory=lambda: PROJECT_ROOT / "cache")
     cache_ttl_seconds: int = 7 * 24 * 60 * 60
     cache_cleanup_interval_seconds: int = 6 * 60 * 60
+    access_token: str = "23dbce5530c211ee939900ff79794a8f"
     yt_dlp_js_runtime: str = "node"
     yt_dlp_remote_component: str = "ejs:github"
     curl_impersonate: str = "chrome"

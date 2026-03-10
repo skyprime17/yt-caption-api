@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.openapi.models import APIKey
 
-from app.dependencies import get_transcript_service
+from app.dependencies import get_transcript_service, require_access_token
 from app.models import TranscriptResponse
 from app.services.transcript_service import TranscriptService
 
@@ -28,6 +29,7 @@ def transcript(
     include_meta: bool = True,
     max_chars: int | None = None,
     use_cache: bool = True,
+    _: APIKey = Depends(require_access_token),
     transcript_service: TranscriptService = Depends(get_transcript_service),
 ):
     video_id = video_id.strip()
