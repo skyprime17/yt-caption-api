@@ -5,12 +5,23 @@ import re
 import subprocess
 import sys
 from typing import Any
+from urllib.parse import urljoin
 
 from curl_cffi import requests
 from fastapi import HTTPException
 
 from app.config import Settings
 from app.services.cache_service import CacheService
+
+
+TRACK_EXTENSION_PRIORITY = {
+    "json3": 0,
+    "srv3": 1,
+    "srv2": 2,
+    "srv1": 3,
+    "vtt": 4,
+    "ttml": 5,
+}
 
 
 class TranscriptService:
@@ -143,36 +154,39 @@ class TranscriptService:
 
         for lang, tracks in subtitles.items():
             for track in tracks:
-                if track.get("ext") in {"json3", "srv1", "srv2", "srv3", "ttml", "vtt"}:
+                if track.get("ext") in TRACK_EXTENSION_PRIORITY:
                     sources.append((lang, track, "subtitles"))
 
         if include_auto:
             for lang, tracks in automatic_captions.items():
                 for track in tracks:
-                    if track.get("ext") in {"json3", "srv1", "srv2", "srv3", "ttml", "vtt"}:
+                    if track.get("ext") in TRACK_EXTENSION_PRIORITY:
                         sources.append((lang, track, "automatic_captions"))
 
         if not sources:
             raise HTTPException(status_code=404, detail="No captions found for this video")
 
+        def sort_key(item: tuple[str, dict[str, Any], str]) -> tuple[int, int]:
+            lang, track, source = item
+            extension_priority = TRACK_EXTENSION_PRIORITY.get(track.get("ext"), 99)
+            source_priority = 0 if source == "subtitles" else 1
+            return (source_priority, extension_priority)
+
         if preferred_language:
             normalized = preferred_language.lower()
-            exact_match = next((item for item in sources if item[0].lower() == normalized), None)
-            if exact_match:
-                return exact_match
+            exact_matches = [item for item in sources if item[0].lower() == normalized]
+            if exact_matches:
+                return min(exact_matches, key=sort_key)
 
-            prefix_match = next(
-                (
-                    item
-                    for item in sources
-                    if item[0].lower().split("-")[0] == normalized.split("-")[0]
-                ),
-                None,
-            )
-            if prefix_match:
-                return prefix_match
+            prefix_matches = [
+                item
+                for item in sources
+                if item[0].lower().split("-")[0] == normalized.split("-")[0]
+            ]
+            if prefix_matches:
+                return min(prefix_matches, key=sort_key)
 
-        return sources[0]
+        return min(sources, key=sort_key)
 
     def _parse_json3_events(self, payload: dict[str, Any]) -> str:
         parts: list[str] = []
@@ -194,6 +208,45 @@ class TranscriptService:
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
+    def _parse_vtt_text(self, text: str) -> str:
+        lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "WEBVTT":
+                continue
+            if line.startswith(("NOTE", "Kind:", "Language:", "X-TIMESTAMP-MAP=")):
+                continue
+            if "-->" in line:
+                continue
+            if re.fullmatch(r"\d+", line):
+                continue
+            lines.append(line)
+
+        return self._clean_transcript_text(" ".join(lines))
+
+    def _resolve_hls_caption_playlist(self, playlist_text: str, playlist_url: str) -> str:
+        segment_urls = [
+            urljoin(playlist_url, line.strip())
+            for line in playlist_text.splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        if not segment_urls:
+            return self._clean_transcript_text(playlist_text)
+
+        parts: list[str] = []
+        for segment_url in segment_urls:
+            response = requests.get(
+                segment_url,
+                impersonate=self.settings.curl_impersonate,
+                timeout=self.settings.caption_fetch_timeout_seconds,
+            )
+            response.raise_for_status()
+            parts.append(self._parse_vtt_text(response.text))
+
+        return self._clean_transcript_text(" ".join(part for part in parts if part))
+
     def _fetch_caption_text(self, track_url: str, extension: str) -> str:
         response = requests.get(
             track_url,
@@ -204,5 +257,11 @@ class TranscriptService:
 
         if extension == "json3":
             return self._parse_json3_events(response.json())
+
+        if response.text.lstrip().startswith("#EXTM3U"):
+            return self._resolve_hls_caption_playlist(response.text, track_url)
+
+        if extension == "vtt":
+            return self._parse_vtt_text(response.text)
 
         return self._clean_transcript_text(response.text)
