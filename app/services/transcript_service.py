@@ -14,7 +14,6 @@ from fastapi import HTTPException
 from app.config import Settings
 from app.services.cache_service import CacheService
 
-
 TRACK_EXTENSION_PRIORITY = {
     "json3": 0,
     "srv3": 1,
@@ -31,19 +30,19 @@ class TranscriptService:
         self.cache_service = cache_service
 
     def get_transcript_payload(
-        self,
-        video_id: str,
-        language: str | None,
-        include_auto: bool,
-        use_cache: bool,
+            self,
+            video_id: str,
+            language: str | None,
+            include_auto: bool,
+            use_cache: bool,
     ) -> tuple[dict[str, Any], str]:
         if use_cache:
             cached_payload = self.cache_service.load(video_id, language, include_auto)
             if cached_payload is not None:
                 return cached_payload, "HIT"
 
-        resolved_url = self._resolve_url(self._build_video_url(video_id))
-        info = self._extract_video_info(resolved_url)
+        video_url = self._build_video_url(video_id)
+        info = self._extract_video_info(video_url)
 
         candidates = self._pick_caption_tracks(
             info=info,
@@ -69,7 +68,7 @@ class TranscriptService:
                 "id": info.get("id"),
                 "title": info.get("title"),
                 "uploader": info.get("uploader"),
-                "webpage_url": info.get("webpage_url") or resolved_url,
+                "webpage_url": info.get("webpage_url") or video_url,
                 "language": selected_language,
                 "source": source,
                 "extension": extension,
@@ -83,11 +82,11 @@ class TranscriptService:
 
         raise HTTPException(status_code=404, detail="No usable captions found for this video")
 
+    @staticmethod
     def shape_response(
-        self,
-        payload: dict[str, Any],
-        include_meta: bool,
-        max_chars: int | None,
+            payload: dict[str, Any],
+            include_meta: bool,
+            max_chars: int | None,
     ) -> dict[str, Any]:
         response_payload = dict(payload)
         transcript = response_payload["transcript"]
@@ -109,16 +108,8 @@ class TranscriptService:
             "transcript": response_payload["transcript"],
         }
 
-    def _resolve_url(self, url: str) -> str:
-        response = requests.head(
-            url,
-            impersonate=self.settings.curl_impersonate,
-            allow_redirects=True,
-            timeout=self.settings.resolve_url_timeout_seconds,
-        )
-        return str(response.url)
-
-    def _build_video_url(self, video_id: str) -> str:
+    @staticmethod
+    def _build_video_url(video_id: str) -> str:
         return f"https://www.youtube.com/watch?v={video_id}"
 
     def _extract_video_info(self, url: str) -> dict[str, Any]:
@@ -161,16 +152,17 @@ class TranscriptService:
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=502, detail="yt-dlp returned invalid JSON") from exc
 
-    def _effective_track_language(self, lang: str, track: dict[str, Any]) -> str:
+    @staticmethod
+    def _effective_track_language(lang: str, track: dict[str, Any]) -> str:
         track_url = track.get("url") or ""
         query = parse_qs(urlparse(track_url).query)
         return (query.get("tlang", [lang])[0] or lang).lower()
 
     def _pick_caption_tracks(
-        self,
-        info: dict[str, Any],
-        preferred_language: str | None,
-        include_auto: bool,
+            self,
+            info: dict[str, Any],
+            preferred_language: str | None,
+            include_auto: bool,
     ) -> list[tuple[str, dict[str, Any], str]]:
         subtitles = info.get("subtitles") or {}
         automatic_captions = info.get("automatic_captions") or {}
@@ -191,7 +183,8 @@ class TranscriptService:
             raise HTTPException(status_code=404, detail="No captions found for this video")
 
         def is_translated_track(track: dict[str, Any]) -> bool:
-            return self._effective_track_language("", track) != (parse_qs(urlparse(track.get("url") or "").query).get("lang", [""])[0] or "").lower()
+            return self._effective_track_language("", track) != (
+                    parse_qs(urlparse(track.get("url") or "").query).get("lang", [""])[0] or "").lower()
 
         def match_priority(item: tuple[str, dict[str, Any], str], normalized: str) -> int:
             language_code = self._effective_track_language(item[0], item[1])
@@ -210,8 +203,8 @@ class TranscriptService:
             return 4
 
         def sort_key(
-            item: tuple[str, dict[str, Any], str],
-            normalized: str | None = None,
+                item: tuple[str, dict[str, Any], str],
+                normalized: str | None = None,
         ) -> tuple[int, int, int, int]:
             _, track, source = item
             extension_priority = TRACK_EXTENSION_PRIORITY.get(track.get("ext"), 99)
@@ -254,11 +247,13 @@ class TranscriptService:
                 parts.append(text)
         return self._clean_transcript_text(" ".join(parts))
 
-    def _clean_caption_fragment(self, text: str) -> str:
+    @staticmethod
+    def _clean_caption_fragment(text: str) -> str:
         text = re.sub(r"<[^>]+>", "", text)
         return html.unescape(text).strip()
 
-    def _clean_transcript_text(self, text: str) -> str:
+    @staticmethod
+    def _clean_transcript_text(text: str) -> str:
         text = text.replace("\r", " ").replace("\n", " ")
         text = re.sub(r"\s+", " ", text)
         text = re.sub(
