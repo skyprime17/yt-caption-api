@@ -8,8 +8,15 @@ dependencies = [
     "curl-cffi>=0.10.0",
     "fastapi>=0.116.0",
     "pydantic>=2.11.0",
+    "pydantic-settings>=2.10.0",
     "uvicorn>=0.35.0",
     "yt-dlp>=2025.3.31",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.0",
+    "pytest>=8.4.0",
 ]
 
 [tool.uv]

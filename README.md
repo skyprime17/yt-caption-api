@@ -18,7 +18,7 @@ uv sync
 ## Run
 
 ```powershell
-uv run uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ## Endpoints
@@ -40,7 +40,6 @@ Smaller responses:
 ```powershell
 curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&include_meta=false"
 curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&max_chars=500"
-curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ/text?language=en"
 ```
 
 ## Notes
