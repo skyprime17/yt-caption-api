@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from typing import Any
 
 from curl_cffi import requests
@@ -101,9 +102,9 @@ class TranscriptService:
 
     def _extract_video_info(self, url: str) -> dict[str, Any]:
         command = [
-            "uv",
-            "run",
-            "yt-dlp",
+            sys.executable,
+            "-m",
+            "yt_dlp",
             "--skip-download",
             "--dump-single-json",
             "--cookies",
