@@ -4,6 +4,13 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.openapi.models import APIKey
 
 from app.dependencies import get_transcript_service, require_access_token
+from app.exceptions import (
+    TranscriptAuthError,
+    TranscriptNotFoundError,
+    TranscriptRateLimitedError,
+    TranscriptUnavailableError,
+    TranscriptUpstreamError,
+)
 from app.models import TranscriptResponse
 from app.services.transcript_service import TranscriptService
 
@@ -39,12 +46,22 @@ def transcript(
     if max_chars is not None and max_chars < 0:
         raise HTTPException(status_code=400, detail="max_chars must be >= 0")
 
-    payload, cache_status = transcript_service.get_transcript_payload(
-        video_id=video_id,
-        language=language,
-        include_auto=include_auto,
-        use_cache=use_cache,
-    )
+    try:
+        payload, cache_status = transcript_service.get_transcript_payload(
+            video_id=video_id,
+            language=language,
+            include_auto=include_auto,
+            use_cache=use_cache,
+        )
+    except (TranscriptNotFoundError, TranscriptUnavailableError) as exc:
+        raise HTTPException(status_code=404, detail=exc.message) from exc
+    except TranscriptAuthError as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from exc
+    except TranscriptRateLimitedError as exc:
+        raise HTTPException(status_code=429, detail=exc.message) from exc
+    except TranscriptUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=exc.message) from exc
+
     response.headers["X-Cache"] = cache_status
     return transcript_service.shape_response(
         payload=payload,

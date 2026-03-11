@@ -7,7 +7,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.exceptions import (
+    TranscriptAuthError,
+    TranscriptNotFoundError,
+    TranscriptRateLimitedError,
+    TranscriptUpstreamError,
+)
 from app.main import create_app
+from app.models import TranscriptResponse
 from app.services.cache_service import CacheService
 from app.services.transcript_service import TranscriptService
 
@@ -55,6 +62,20 @@ class FakeTranscriptService:
             "extension": None,
             "transcript": transcript,
         }
+
+
+class RaisingTranscriptService:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def get_transcript_payload(
+        self,
+        video_id: str,
+        language: str | None,
+        include_auto: bool,
+        use_cache: bool,
+    ):
+        raise self.error
 
 
 def make_settings(tmp_path: Path, cookies_exists: bool = True) -> Settings:
@@ -145,13 +166,66 @@ def test_transcript_service_shapes_response(tmp_path: Path) -> None:
         "transcript": "abcdef",
     }
 
-    assert service.shape_response(payload, include_meta=False, max_chars=3) == {
-        "id": "demo123",
-        "title": None,
-        "uploader": None,
-        "webpage_url": None,
-        "language": "en",
-        "source": None,
-        "extension": None,
-        "transcript": "abc",
-    }
+    assert service.shape_response(payload, include_meta=False, max_chars=3) == TranscriptResponse(
+        id="demo123",
+        title=None,
+        uploader=None,
+        webpage_url=None,
+        language="en",
+        source=None,
+        extension=None,
+        transcript="abc",
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (TranscriptNotFoundError("missing"), 404),
+        (TranscriptAuthError("forbidden"), 403),
+        (TranscriptRateLimitedError("slow down"), 429),
+        (TranscriptUpstreamError("upstream blew up"), 502),
+    ],
+)
+def test_router_maps_service_exceptions_to_http_statuses(
+    tmp_path: Path,
+    error: Exception,
+    expected_status: int,
+) -> None:
+    settings = make_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        app.state.transcript_service = RaisingTranscriptService(error)
+
+        response = client.get(
+            "/transcript/demo123",
+            params={"language": "en"},
+            headers=auth_headers(settings),
+        )
+
+    assert response.status_code == expected_status
+
+
+def test_router_returns_direct_path_error_when_fallback_also_fails(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    cache_service = CacheService(settings)
+    service = TranscriptService(settings, cache_service)
+
+    def fail_direct(*args, **kwargs):
+        raise TranscriptRateLimitedError("direct rate limited")
+
+    def fail_fallback(*args, **kwargs):
+        raise TranscriptUpstreamError("yt-dlp failed")
+
+    service._extract_transcript_direct_payload = fail_direct  # type: ignore[method-assign]
+    service._extract_video_info = lambda *args, **kwargs: {"id": "demo123"}  # type: ignore[assignment]
+    service._extract_transcript_via_yt_dlp = fail_fallback  # type: ignore[method-assign]
+
+    with pytest.raises(TranscriptRateLimitedError, match="direct rate limited"):
+        service.get_transcript_payload(
+            video_id="demo123",
+            language="en",
+            include_auto=True,
+            use_cache=False,
+        )

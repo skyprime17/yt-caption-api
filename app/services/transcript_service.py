@@ -7,16 +7,29 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from curl_cffi import requests
-from fastapi import HTTPException
+from requests import Session
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptList
+from youtube_transcript_api._errors import NoTranscriptFound
 
 from app.config import Settings
+from app.exceptions import (
+    TranscriptAuthError,
+    TranscriptNotFoundError,
+    TranscriptRateLimitedError,
+    TranscriptServiceError,
+    TranscriptUnavailableError,
+    TranscriptUpstreamError,
+)
+from app.models import TranscriptResponse
 from app.services.cache_service import CacheService
 
 logger = logging.getLogger(__name__)
+
+CacheStatus = Literal["HIT", "MISS"]
 
 TRACK_EXTENSION_PRIORITY = {
     "json3": 0,
@@ -39,7 +52,7 @@ class TranscriptService:
             language: str | None,
             include_auto: bool,
             use_cache: bool,
-    ) -> tuple[dict[str, Any], str]:
+    ) -> tuple[TranscriptResponse, CacheStatus]:
         if use_cache:
             cached_payload = self.cache_service.load(video_id, language, include_auto)
             if cached_payload is not None:
@@ -49,7 +62,7 @@ class TranscriptService:
                     language,
                     include_auto,
                 )
-                return cached_payload, "HIT"
+                return TranscriptResponse.model_validate(cached_payload), "HIT"
 
         logger.info(
             "Transcript fetch start: video_id=%s language=%s include_auto=%s use_cache=%s",
@@ -59,125 +72,104 @@ class TranscriptService:
             use_cache,
         )
         video_url = self._build_video_url(video_id)
-        info = self._extract_video_info(video_url)
+        info: dict[str, Any] | None = None
+        direct_error: TranscriptServiceError | None = None
 
-        candidates = self._pick_caption_tracks(
-            info=info,
-            preferred_language=language,
-            include_auto=include_auto,
-        )
-        logger.info(
-            "Caption candidates selected: video_id=%s count=%s candidates=%s",
-            video_id,
-            len(candidates),
-            [
-                {
-                    "language": selected_language,
-                    "source": source,
-                    "ext": track.get("ext"),
-                    "client": track.get("__yt_dlp_client"),
-                }
-                for selected_language, track, source in candidates[:5]
-            ],
-        )
-        last_error: HTTPException | None = None
-
-        for selected_language, track, source in candidates:
-            track_url = track.get("url")
-            extension = track.get("ext") or ""
-            if not track_url:
-                logger.warning(
-                    "Caption candidate missing URL: video_id=%s language=%s source=%s ext=%s",
-                    video_id,
-                    selected_language,
-                    source,
-                    extension,
-                )
-                last_error = HTTPException(status_code=404, detail="Caption track URL missing")
-                continue
-
-            try:
-                text = self._fetch_caption_text(track_url, extension)
-            except HTTPException as exc:
-                logger.warning(
-                    "Caption candidate failed: video_id=%s language=%s source=%s ext=%s status=%s detail=%s",
-                    video_id,
-                    selected_language,
-                    source,
-                    extension,
-                    exc.status_code,
-                    exc.detail,
-                )
-                last_error = exc
-                continue
-
-            payload = {
-                "id": info.get("id"),
-                "title": info.get("title"),
-                "uploader": info.get("uploader"),
-                "webpage_url": info.get("webpage_url") or video_url,
-                "language": selected_language,
-                "source": source,
-                "extension": extension,
-                "transcript": text,
-            }
-            self.cache_service.save(video_id, language, include_auto, payload)
-            logger.info(
-                "Transcript fetch success: video_id=%s selected_language=%s source=%s ext=%s transcript_chars=%s",
+        try:
+            payload = self._extract_transcript_direct_payload(
+                video_id=video_id,
+                language=language,
+                video_url=video_url,
+                info=None,
+            )
+        except TranscriptServiceError as exc:
+            logger.warning(
+                "Direct transcript path failed, trying yt-dlp fallback: video_id=%s language=%s error=%s cause=%s upstream_status=%s",
                 video_id,
-                selected_language,
-                source,
-                extension,
-                len(text),
+                language,
+                exc.message,
+                exc.cause,
+                exc.upstream_status,
+            )
+            direct_error = exc
+        else:
+            self.cache_service.save(video_id, language, include_auto, payload.model_dump())
+            logger.info(
+                "Transcript fetch success via direct path: video_id=%s language=%s transcript_chars=%s",
+                video_id,
+                payload.language,
+                len(payload.transcript),
             )
             return payload, "MISS"
 
-        if last_error is not None:
+        try:
+            info = self._extract_video_info(video_url)
+            fallback_payload = self._extract_transcript_via_yt_dlp(
+                info=info,
+                video_url=video_url,
+                preferred_language=language,
+                include_auto=include_auto,
+            )
+        except TranscriptServiceError as exc:
             logger.error(
-                "Transcript fetch failed after trying all candidates: video_id=%s language=%s status=%s detail=%s",
+                "yt-dlp fallback failed: video_id=%s language=%s error=%s cause=%s upstream_status=%s",
                 video_id,
                 language,
-                last_error.status_code,
-                last_error.detail,
+                exc.message,
+                exc.cause,
+                exc.upstream_status,
             )
-            raise last_error
+            if direct_error is not None:
+                raise direct_error
+            raise exc
 
-        logger.error(
-            "Transcript fetch failed with no usable candidates: video_id=%s language=%s",
+        self.cache_service.save(video_id, language, include_auto, fallback_payload.model_dump())
+        logger.info(
+            "Transcript fetch success via yt-dlp fallback: video_id=%s language=%s transcript_chars=%s",
             video_id,
-            language,
+            fallback_payload.language,
+            len(fallback_payload.transcript),
         )
-        raise HTTPException(status_code=404, detail="No usable captions found for this video")
+        return fallback_payload, "MISS"
 
     @staticmethod
     def shape_response(
-            payload: dict[str, Any],
+            payload: TranscriptResponse | dict[str, Any],
             include_meta: bool,
             max_chars: int | None,
-    ) -> dict[str, Any]:
-        response_payload = dict(payload)
-        transcript = response_payload["transcript"]
+    ) -> TranscriptResponse:
+        response_payload = TranscriptResponse.model_validate(payload).model_copy()
+        transcript = response_payload.transcript
         if max_chars is not None and max_chars >= 0:
             transcript = transcript[:max_chars].rstrip()
-        response_payload["transcript"] = transcript
+        response_payload.transcript = transcript
 
         if include_meta:
             return response_payload
 
-        return {
-            "id": response_payload["id"],
-            "title": None,
-            "uploader": None,
-            "webpage_url": None,
-            "language": response_payload["language"],
-            "source": None,
-            "extension": None,
-            "transcript": response_payload["transcript"],
-        }
+        return TranscriptResponse(
+            id=response_payload.id,
+            title=None,
+            uploader=None,
+            webpage_url=None,
+            language=response_payload.language,
+            source=None,
+            extension=None,
+            transcript=response_payload.transcript,
+        )
 
     @staticmethod
     def _build_video_url(video_id: str) -> str:
         return f"https://www.youtube.com/watch?v={video_id}"
+
+    @staticmethod
+    def _build_timeout_session(timeout_seconds: float) -> Session:
+        class TimeoutSession(Session):
+            def request(self, *args, **kwargs):
+                kwargs.setdefault("timeout", timeout_seconds)
+                return super().request(*args, **kwargs)
+
+        return TimeoutSession()
 
     @staticmethod
     def _map_yt_dlp_error(message: str) -> tuple[int, bool]:
@@ -189,6 +181,244 @@ class TranscriptService:
         if "not available" in lowered or "unavailable" in lowered:
             return 404, False
         return 502, True
+
+    @staticmethod
+    def _service_error_from_status(
+            status_code: int,
+            message: str,
+            *,
+            cause: str | None = None,
+    ) -> TranscriptServiceError:
+        if status_code == 404:
+            return TranscriptNotFoundError(message, cause=cause, upstream_status=status_code)
+        if status_code == 403:
+            return TranscriptAuthError(message, cause=cause, upstream_status=status_code)
+        if status_code == 429:
+            return TranscriptRateLimitedError(message, cause=cause, upstream_status=status_code)
+        if status_code == 502:
+            return TranscriptUpstreamError(message, cause=cause, upstream_status=status_code)
+        return TranscriptUpstreamError(message, cause=cause, upstream_status=status_code)
+
+    @staticmethod
+    def _build_payload(
+            *,
+            video_id: str,
+            video_url: str,
+            language: str,
+            source: str,
+            extension: str | None,
+            transcript: str,
+            info: dict[str, Any] | None = None,
+    ) -> TranscriptResponse:
+        return TranscriptResponse(
+            id=(info or {}).get("id") or video_id,
+            title=(info or {}).get("title"),
+            uploader=(info or {}).get("uploader"),
+            webpage_url=(info or {}).get("webpage_url") or video_url,
+            language=language,
+            source=source,
+            extension=extension,
+            transcript=transcript,
+        )
+
+    def _extract_transcript_via_yt_dlp(
+            self,
+            *,
+            info: dict[str, Any],
+            video_url: str,
+            preferred_language: str | None,
+            include_auto: bool,
+    ) -> TranscriptResponse:
+        candidates = self._pick_caption_tracks(
+            info=info,
+            preferred_language=preferred_language,
+            include_auto=include_auto,
+        )
+        logger.info(
+            "Caption candidates selected: video_id=%s count=%s candidates=%s",
+            info.get("id"),
+            len(candidates),
+            [
+                {
+                    "language": selected_language,
+                    "source": source,
+                    "ext": track.get("ext"),
+                    "client": track.get("__yt_dlp_client"),
+                }
+                for selected_language, track, source in candidates[:5]
+            ],
+        )
+        last_error: TranscriptServiceError | None = None
+
+        for selected_language, track, source in candidates:
+            track_url = track.get("url")
+            extension = track.get("ext") or ""
+            if not track_url:
+                logger.warning(
+                    "Caption candidate missing URL: video_id=%s language=%s source=%s ext=%s",
+                    info.get("id"),
+                    selected_language,
+                    source,
+                    extension,
+                )
+                last_error = TranscriptNotFoundError("Caption track URL missing")
+                continue
+
+            try:
+                text = self._fetch_caption_text(track_url, extension)
+            except TranscriptServiceError as exc:
+                logger.warning(
+                    "Caption candidate failed: video_id=%s language=%s source=%s ext=%s error=%s cause=%s upstream_status=%s",
+                    info.get("id"),
+                    selected_language,
+                    source,
+                    extension,
+                    exc.message,
+                    exc.cause,
+                    exc.upstream_status,
+                )
+                last_error = exc
+                continue
+
+            logger.info(
+                "Transcript fetch success: video_id=%s selected_language=%s source=%s ext=%s transcript_chars=%s",
+                info.get("id"),
+                selected_language,
+                source,
+                extension,
+                len(text),
+            )
+            return self._build_payload(
+                video_id=info.get("id") or "",
+                video_url=video_url,
+                language=selected_language,
+                source=source,
+                extension=extension,
+                transcript=text,
+                info=info,
+            )
+
+        if last_error is not None:
+            logger.error(
+                "Transcript fetch failed after trying all candidates: video_id=%s language=%s error=%s cause=%s upstream_status=%s",
+                info.get("id"),
+                preferred_language,
+                last_error.message,
+                last_error.cause,
+                last_error.upstream_status,
+            )
+            raise last_error
+
+        logger.error(
+            "Transcript fetch failed with no usable candidates: video_id=%s language=%s",
+            info.get("id"),
+            preferred_language,
+        )
+        raise TranscriptUnavailableError("No usable captions found for this video")
+
+
+    def _extract_transcript_direct(self, video_id: str, language: str | None) -> str:
+        transcript_api = YouTubeTranscriptApi(
+            http_client=self._build_timeout_session(self.settings.caption_fetch_timeout_seconds)
+        )
+        transcript_list = transcript_api.list(video_id)
+        transcript = self._pick_direct_transcript(transcript_list, language)
+        return self._clean_transcript_text(" ".join(
+            s.text.strip()
+            for s in transcript
+            if getattr(s, "text", None) and s.text.strip()
+        ))
+
+    @staticmethod
+    def _pick_direct_transcript(transcript_list: TranscriptList, preferred_language: str | None):
+        available_transcripts = list(transcript_list)
+        if not available_transcripts:
+            raise TranscriptNotFoundError("No transcripts found for this video")
+
+        if not preferred_language:
+            manual = [item for item in available_transcripts if not item.is_generated]
+            if manual:
+                return manual[0].fetch()
+            return available_transcripts[0].fetch()
+
+        normalized_preferred = preferred_language.lower()
+        preferred_prefix = normalized_preferred.split("-")[0]
+
+        def sort_key(transcript) -> tuple[int, int]:
+            language_code = transcript.language_code.lower()
+            language_prefix = language_code.split("-")[0]
+
+            if language_code == normalized_preferred:
+                language_rank = 0
+            elif language_prefix == preferred_prefix:
+                language_rank = 1
+            else:
+                language_rank = 2
+
+            generated_rank = 1 if transcript.is_generated else 0
+            return language_rank, generated_rank
+
+        sorted_transcripts = sorted(available_transcripts, key=sort_key)
+        best_match = sorted_transcripts[0]
+        if sort_key(best_match)[0] == 2:
+            raise TranscriptNotFoundError(
+                "No transcript found for the requested language",
+                cause=f"Requested={preferred_language}; available={[item.language_code for item in available_transcripts]}",
+                upstream_status=404,
+            )
+
+        return best_match.fetch()
+
+    def _extract_transcript_direct_payload(
+            self,
+            *,
+            video_id: str,
+            language: str | None,
+            video_url: str,
+            info: dict[str, Any] | None,
+    ) -> TranscriptResponse:
+        try:
+            transcript = self._extract_transcript_direct(video_id, language)
+        except NoTranscriptFound as exc:
+            logger.info(
+                "Direct transcript language match not found: video_id=%s language=%s available=%s",
+                video_id,
+                language,
+                str(exc),
+            )
+            raise TranscriptNotFoundError(
+                "No transcript found for the requested language",
+                cause=str(exc),
+                upstream_status=404,
+            ) from exc
+        except TranscriptNotFoundError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Direct transcript extraction raised an exception: video_id=%s language=%s",
+                video_id,
+                language,
+            )
+            raise TranscriptUpstreamError(
+                "Direct transcript extraction failed",
+                cause=str(exc),
+                upstream_status=502,
+            ) from exc
+
+        if not transcript:
+            raise TranscriptUnavailableError("Direct transcript extraction returned empty transcript")
+
+        resolved_language = language or (info or {}).get("language") or "unknown"
+        return self._build_payload(
+            video_id=video_id,
+            video_url=video_url,
+            language=resolved_language,
+            source="youtube_transcript_api",
+            extension=None,
+            transcript=transcript,
+            info=info,
+        )
+
 
     def _extract_video_info(self, url: str) -> dict[str, Any]:
         command = [
@@ -205,7 +435,7 @@ class TranscriptService:
             self.settings.yt_dlp_remote_component,
             url,
         ]
-        last_error: HTTPException | None = None
+        last_error: TranscriptServiceError | None = None
         attempts = max(1, self.settings.yt_dlp_retry_attempts)
 
         for attempt in range(1, attempts + 1):
@@ -219,13 +449,21 @@ class TranscriptService:
                 )
             except OSError as exc:
                 logger.exception("yt-dlp subprocess launch failed: url=%s", url)
-                raise HTTPException(status_code=502, detail="Failed to start yt-dlp") from exc
+                raise TranscriptUpstreamError(
+                    "Failed to start yt-dlp",
+                    cause=str(exc),
+                    upstream_status=502,
+                ) from exc
 
             if completed.returncode == 0:
                 try:
                     return json.loads(completed.stdout)
                 except json.JSONDecodeError as exc:
-                    last_error = HTTPException(status_code=502, detail="yt-dlp returned invalid JSON")
+                    last_error = TranscriptUpstreamError(
+                        "yt-dlp returned invalid JSON",
+                        cause=str(exc),
+                        upstream_status=502,
+                    )
                     should_retry = attempt < attempts
                     logger.warning(
                         "yt-dlp returned invalid JSON: url=%s attempt=%s/%s stdout_prefix=%r retry=%s",
@@ -242,7 +480,11 @@ class TranscriptService:
 
             message = completed.stderr.strip() or completed.stdout.strip() or "Unknown yt-dlp error"
             status_code, retryable = self._map_yt_dlp_error(message)
-            last_error = HTTPException(status_code=status_code, detail=f"yt-dlp failed: {message}")
+            last_error = self._service_error_from_status(
+                status_code,
+                f"yt-dlp failed: {message}",
+                cause=message,
+            )
             logger.warning(
                 "yt-dlp extraction failed: url=%s attempt=%s/%s status=%s retryable=%s message=%s",
                 url,
@@ -259,7 +501,7 @@ class TranscriptService:
 
         if last_error is not None:
             raise last_error
-        raise HTTPException(status_code=502, detail="yt-dlp failed unexpectedly")
+        raise TranscriptUpstreamError("yt-dlp failed unexpectedly", upstream_status=502)
 
     @staticmethod
     def _effective_track_language(lang: str, track: dict[str, Any]) -> str:
@@ -299,7 +541,7 @@ class TranscriptService:
                         sources.append((lang, track, "automatic_captions"))
 
         if not sources:
-            raise HTTPException(status_code=404, detail="No captions found for this video")
+            raise TranscriptNotFoundError("No captions found for this video")
 
         def is_translated_track(track: dict[str, Any]) -> bool:
             track_url = track.get("url") or ""
@@ -312,7 +554,7 @@ class TranscriptService:
         sources = [item for item in sources if not is_translated_track(item[1])]
 
         if not sources:
-            raise HTTPException(status_code=404, detail="No non-translated captions found for this video")
+            raise TranscriptUnavailableError("No non-translated captions found for this video")
 
         normalized_preferred = preferred_language.lower() if preferred_language else None
         preferred_prefix = normalized_preferred.split("-")[0] if normalized_preferred else None
@@ -441,11 +683,21 @@ class TranscriptService:
                     index,
                     segment_url,
                 )
-                raise HTTPException(status_code=502, detail="Caption segment request failed") from exc
+                raise TranscriptUpstreamError(
+                    "Caption segment request failed",
+                    cause=str(exc),
+                    upstream_status=502,
+                ) from exc
             if response.status_code == 429:
-                raise HTTPException(status_code=429, detail="YouTube rate limited caption segment fetch")
+                raise TranscriptRateLimitedError(
+                    "YouTube rate limited caption segment fetch",
+                    upstream_status=429,
+                )
             if response.status_code == 403:
-                raise HTTPException(status_code=403, detail="YouTube rejected caption segment fetch")
+                raise TranscriptAuthError(
+                    "YouTube rejected caption segment fetch",
+                    upstream_status=403,
+                )
             if response.status_code >= 400:
                 logger.warning(
                     "Caption segment fetch returned error: playlist_url=%s segment_index=%s status=%s segment_url=%s",
@@ -454,9 +706,9 @@ class TranscriptService:
                     response.status_code,
                     segment_url,
                 )
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Caption segment fetch failed with status {response.status_code}",
+                raise TranscriptUpstreamError(
+                    f"Caption segment fetch failed with status {response.status_code}",
+                    upstream_status=response.status_code,
                 )
             parts.append(self._parse_vtt_text(response.text))
 
@@ -471,13 +723,26 @@ class TranscriptService:
             )
         except Exception as exc:
             logger.exception("Caption track request failed: ext=%s track_url=%s", extension, track_url)
-            raise HTTPException(status_code=502, detail="Caption track request failed") from exc
+            raise TranscriptUpstreamError(
+                "Caption track request failed",
+                cause=str(exc),
+                upstream_status=502,
+            ) from exc
         if response.status_code == 429:
-            raise HTTPException(status_code=429, detail="YouTube rate limited caption fetch")
+            raise TranscriptRateLimitedError(
+                "YouTube rate limited caption fetch",
+                upstream_status=429,
+            )
         if response.status_code == 403:
-            raise HTTPException(status_code=403, detail="YouTube rejected caption fetch")
+            raise TranscriptAuthError(
+                "YouTube rejected caption fetch",
+                upstream_status=403,
+            )
         if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Caption track was unavailable")
+            raise TranscriptNotFoundError(
+                "Caption track was unavailable",
+                upstream_status=404,
+            )
         if response.status_code >= 400:
             logger.warning(
                 "Caption track fetch returned error: ext=%s status=%s track_url=%s",
@@ -485,9 +750,9 @@ class TranscriptService:
                 response.status_code,
                 track_url,
             )
-            raise HTTPException(
-                status_code=502,
-                detail=f"Caption track fetch failed with status {response.status_code}",
+            raise TranscriptUpstreamError(
+                f"Caption track fetch failed with status {response.status_code}",
+                upstream_status=response.status_code,
             )
 
         if extension == "json3":
@@ -495,7 +760,11 @@ class TranscriptService:
                 return self._parse_json3_events(response.json())
             except ValueError as exc:
                 logger.exception("Caption json3 parse failed: track_url=%s", track_url)
-                raise HTTPException(status_code=502, detail="Caption JSON parse failed") from exc
+                raise TranscriptUpstreamError(
+                    "Caption JSON parse failed",
+                    cause=str(exc),
+                    upstream_status=502,
+                ) from exc
 
         if response.text.lstrip().startswith("#EXTM3U"):
             return self._resolve_hls_caption_playlist(response.text, track_url)
