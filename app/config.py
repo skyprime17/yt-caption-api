@@ -19,6 +19,7 @@ class Settings(BaseSettings):
 
     app_name: str = "YT Caption API"
     app_version: str = "0.1.0"
+    log_level: str = "INFO"
     cookies_file: Path = Field(default_factory=lambda: PROJECT_ROOT / "cookies.txt")
     cache_dir: Path = Field(default_factory=lambda: PROJECT_ROOT / "cache")
     cache_ttl_seconds: int = 7 * 24 * 60 * 60

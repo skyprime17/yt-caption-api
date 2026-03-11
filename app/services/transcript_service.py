@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from fastapi import HTTPException
 
 from app.config import Settings
 from app.services.cache_service import CacheService
+
+logger = logging.getLogger(__name__)
 
 TRACK_EXTENSION_PRIORITY = {
     "json3": 0,
@@ -40,8 +43,21 @@ class TranscriptService:
         if use_cache:
             cached_payload = self.cache_service.load(video_id, language, include_auto)
             if cached_payload is not None:
+                logger.info(
+                    "Transcript cache hit: video_id=%s language=%s include_auto=%s",
+                    video_id,
+                    language,
+                    include_auto,
+                )
                 return cached_payload, "HIT"
 
+        logger.info(
+            "Transcript fetch start: video_id=%s language=%s include_auto=%s use_cache=%s",
+            video_id,
+            language,
+            include_auto,
+            use_cache,
+        )
         video_url = self._build_video_url(video_id)
         info = self._extract_video_info(video_url)
 
@@ -50,18 +66,48 @@ class TranscriptService:
             preferred_language=language,
             include_auto=include_auto,
         )
+        logger.info(
+            "Caption candidates selected: video_id=%s count=%s candidates=%s",
+            video_id,
+            len(candidates),
+            [
+                {
+                    "language": selected_language,
+                    "source": source,
+                    "ext": track.get("ext"),
+                    "client": track.get("__yt_dlp_client"),
+                }
+                for selected_language, track, source in candidates[:5]
+            ],
+        )
         last_error: HTTPException | None = None
 
         for selected_language, track, source in candidates:
             track_url = track.get("url")
             extension = track.get("ext") or ""
             if not track_url:
+                logger.warning(
+                    "Caption candidate missing URL: video_id=%s language=%s source=%s ext=%s",
+                    video_id,
+                    selected_language,
+                    source,
+                    extension,
+                )
                 last_error = HTTPException(status_code=404, detail="Caption track URL missing")
                 continue
 
             try:
                 text = self._fetch_caption_text(track_url, extension)
             except HTTPException as exc:
+                logger.warning(
+                    "Caption candidate failed: video_id=%s language=%s source=%s ext=%s status=%s detail=%s",
+                    video_id,
+                    selected_language,
+                    source,
+                    extension,
+                    exc.status_code,
+                    exc.detail,
+                )
                 last_error = exc
                 continue
 
@@ -76,11 +122,31 @@ class TranscriptService:
                 "transcript": text,
             }
             self.cache_service.save(video_id, language, include_auto, payload)
+            logger.info(
+                "Transcript fetch success: video_id=%s selected_language=%s source=%s ext=%s transcript_chars=%s",
+                video_id,
+                selected_language,
+                source,
+                extension,
+                len(text),
+            )
             return payload, "MISS"
 
         if last_error is not None:
+            logger.error(
+                "Transcript fetch failed after trying all candidates: video_id=%s language=%s status=%s detail=%s",
+                video_id,
+                language,
+                last_error.status_code,
+                last_error.detail,
+            )
             raise last_error
 
+        logger.error(
+            "Transcript fetch failed with no usable candidates: video_id=%s language=%s",
+            video_id,
+            language,
+        )
         raise HTTPException(status_code=404, detail="No usable captions found for this video")
 
     @staticmethod
@@ -143,19 +209,32 @@ class TranscriptService:
         attempts = max(1, self.settings.yt_dlp_retry_attempts)
 
         for attempt in range(1, attempts + 1):
-            completed = subprocess.run(
-                command,
-                cwd=self.settings.cookies_file.parent,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=self.settings.cookies_file.parent,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except OSError as exc:
+                logger.exception("yt-dlp subprocess launch failed: url=%s", url)
+                raise HTTPException(status_code=502, detail="Failed to start yt-dlp") from exc
+
             if completed.returncode == 0:
                 try:
                     return json.loads(completed.stdout)
                 except json.JSONDecodeError as exc:
                     last_error = HTTPException(status_code=502, detail="yt-dlp returned invalid JSON")
                     should_retry = attempt < attempts
+                    logger.warning(
+                        "yt-dlp returned invalid JSON: url=%s attempt=%s/%s stdout_prefix=%r retry=%s",
+                        url,
+                        attempt,
+                        attempts,
+                        completed.stdout[:300],
+                        should_retry,
+                    )
                     if should_retry:
                         time.sleep(self.settings.yt_dlp_retry_delay_seconds)
                         continue
@@ -164,6 +243,15 @@ class TranscriptService:
             message = completed.stderr.strip() or completed.stdout.strip() or "Unknown yt-dlp error"
             status_code, retryable = self._map_yt_dlp_error(message)
             last_error = HTTPException(status_code=status_code, detail=f"yt-dlp failed: {message}")
+            logger.warning(
+                "yt-dlp extraction failed: url=%s attempt=%s/%s status=%s retryable=%s message=%s",
+                url,
+                attempt,
+                attempts,
+                status_code,
+                retryable,
+                message,
+            )
             if retryable and attempt < attempts:
                 time.sleep(self.settings.yt_dlp_retry_delay_seconds)
                 continue
@@ -333,38 +421,81 @@ class TranscriptService:
         if not segment_urls:
             return self._clean_transcript_text(playlist_text)
 
+        logger.info(
+            "Resolving HLS caption playlist: playlist_url=%s segments=%s",
+            playlist_url,
+            len(segment_urls),
+        )
         parts: list[str] = []
-        for segment_url in segment_urls:
-            response = requests.get(
-                segment_url,
-                impersonate=self.settings.curl_impersonate,
-                timeout=self.settings.caption_fetch_timeout_seconds,
-            )
+        for index, segment_url in enumerate(segment_urls, start=1):
+            try:
+                response = requests.get(
+                    segment_url,
+                    impersonate=self.settings.curl_impersonate,
+                    timeout=self.settings.caption_fetch_timeout_seconds,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Caption segment request failed: playlist_url=%s segment_index=%s segment_url=%s",
+                    playlist_url,
+                    index,
+                    segment_url,
+                )
+                raise HTTPException(status_code=502, detail="Caption segment request failed") from exc
             if response.status_code == 429:
                 raise HTTPException(status_code=429, detail="YouTube rate limited caption segment fetch")
             if response.status_code == 403:
                 raise HTTPException(status_code=403, detail="YouTube rejected caption segment fetch")
-            response.raise_for_status()
+            if response.status_code >= 400:
+                logger.warning(
+                    "Caption segment fetch returned error: playlist_url=%s segment_index=%s status=%s segment_url=%s",
+                    playlist_url,
+                    index,
+                    response.status_code,
+                    segment_url,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Caption segment fetch failed with status {response.status_code}",
+                )
             parts.append(self._parse_vtt_text(response.text))
 
         return self._clean_transcript_text(" ".join(part for part in parts if part))
 
     def _fetch_caption_text(self, track_url: str, extension: str) -> str:
-        response = requests.get(
-            track_url,
-            impersonate=self.settings.curl_impersonate,
-            timeout=self.settings.caption_fetch_timeout_seconds,
-        )
+        try:
+            response = requests.get(
+                track_url,
+                impersonate=self.settings.curl_impersonate,
+                timeout=self.settings.caption_fetch_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.exception("Caption track request failed: ext=%s track_url=%s", extension, track_url)
+            raise HTTPException(status_code=502, detail="Caption track request failed") from exc
         if response.status_code == 429:
             raise HTTPException(status_code=429, detail="YouTube rate limited caption fetch")
         if response.status_code == 403:
             raise HTTPException(status_code=403, detail="YouTube rejected caption fetch")
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="Caption track was unavailable")
-        response.raise_for_status()
+        if response.status_code >= 400:
+            logger.warning(
+                "Caption track fetch returned error: ext=%s status=%s track_url=%s",
+                extension,
+                response.status_code,
+                track_url,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Caption track fetch failed with status {response.status_code}",
+            )
 
         if extension == "json3":
-            return self._parse_json3_events(response.json())
+            try:
+                return self._parse_json3_events(response.json())
+            except ValueError as exc:
+                logger.exception("Caption json3 parse failed: track_url=%s", track_url)
+                raise HTTPException(status_code=502, detail="Caption JSON parse failed") from exc
 
         if response.text.lstrip().startswith("#EXTM3U"):
             return self._resolve_hls_caption_playlist(response.text, track_url)
