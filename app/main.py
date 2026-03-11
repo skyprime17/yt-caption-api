@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
+import uvicorn
 from fastapi import FastAPI
 
 from app.config import Settings, get_settings
@@ -58,3 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 app = create_app()
+
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=False)

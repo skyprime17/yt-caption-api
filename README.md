@@ -91,6 +91,7 @@ curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&max_chars=500
 - `cookies.txt` is expected in the project root.
 - Requests to `/transcript/...` must include `X-AccessToken`.
 - Node should be installed and available on `PATH`.
+- `yt-dlp` extraction retries can be tuned with `YT_DLP_RETRY_ATTEMPTS` and `YT_DLP_RETRY_DELAY_SECONDS`.
 - The API prefers normal subtitles and falls back to auto captions by default.
 - You can disable auto captions with `?include_auto=false`.
 - Captions are cached on disk in `cache/` by video ID + language + auto-caption mode.

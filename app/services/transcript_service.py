@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -112,6 +113,17 @@ class TranscriptService:
     def _build_video_url(video_id: str) -> str:
         return f"https://www.youtube.com/watch?v={video_id}"
 
+    @staticmethod
+    def _map_yt_dlp_error(message: str) -> tuple[int, bool]:
+        lowered = message.lower()
+        if "too many requests" in lowered or "429" in lowered:
+            return 429, True
+        if "forbidden" in lowered or "sign in" in lowered or "login" in lowered:
+            return 403, False
+        if "not available" in lowered or "unavailable" in lowered:
+            return 404, False
+        return 502, True
+
     def _extract_video_info(self, url: str) -> dict[str, Any]:
         command = [
             sys.executable,
@@ -127,30 +139,39 @@ class TranscriptService:
             self.settings.yt_dlp_remote_component,
             url,
         ]
-        completed = subprocess.run(
-            command,
-            cwd=self.settings.cookies_file.parent,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            message = completed.stderr.strip() or completed.stdout.strip() or "Unknown yt-dlp error"
-            lowered = message.lower()
-            if "too many requests" in lowered or "429" in lowered:
-                status_code = 429
-            elif "forbidden" in lowered or "sign in" in lowered or "login" in lowered:
-                status_code = 403
-            elif "not available" in lowered or "unavailable" in lowered:
-                status_code = 404
-            else:
-                status_code = 502
-            raise HTTPException(status_code=status_code, detail=f"yt-dlp failed: {message}")
+        last_error: HTTPException | None = None
+        attempts = max(1, self.settings.yt_dlp_retry_attempts)
 
-        try:
-            return json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=502, detail="yt-dlp returned invalid JSON") from exc
+        for attempt in range(1, attempts + 1):
+            completed = subprocess.run(
+                command,
+                cwd=self.settings.cookies_file.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode == 0:
+                try:
+                    return json.loads(completed.stdout)
+                except json.JSONDecodeError as exc:
+                    last_error = HTTPException(status_code=502, detail="yt-dlp returned invalid JSON")
+                    should_retry = attempt < attempts
+                    if should_retry:
+                        time.sleep(self.settings.yt_dlp_retry_delay_seconds)
+                        continue
+                    raise last_error from exc
+
+            message = completed.stderr.strip() or completed.stdout.strip() or "Unknown yt-dlp error"
+            status_code, retryable = self._map_yt_dlp_error(message)
+            last_error = HTTPException(status_code=status_code, detail=f"yt-dlp failed: {message}")
+            if retryable and attempt < attempts:
+                time.sleep(self.settings.yt_dlp_retry_delay_seconds)
+                continue
+            raise last_error
+
+        if last_error is not None:
+            raise last_error
+        raise HTTPException(status_code=502, detail="yt-dlp failed unexpectedly")
 
     @staticmethod
     def _effective_track_language(lang: str, track: dict[str, Any]) -> str:

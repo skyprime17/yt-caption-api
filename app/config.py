@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     access_token: str = "23dbce5530c211ee939900ff79794a8f"
     yt_dlp_js_runtime: str = "node"
     yt_dlp_remote_component: str = "ejs:github"
+    yt_dlp_retry_attempts: int = 3
+    yt_dlp_retry_delay_seconds: float = 1.5
     curl_impersonate: str = "chrome"
     resolve_url_timeout_seconds: int = 20
     caption_fetch_timeout_seconds: int = 30
