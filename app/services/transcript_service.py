@@ -12,8 +12,8 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from curl_cffi import requests
 from requests import Session
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptList
-from youtube_transcript_api._errors import NoTranscriptFound
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptList, NoTranscriptFound, TranscriptsDisabled, \
+    VideoUnavailable
 
 from app.config import Settings
 from app.exceptions import (
@@ -82,6 +82,8 @@ class TranscriptService:
                 video_url=video_url,
                 info=None,
             )
+        except TranscriptNotFoundError:
+            raise
         except TranscriptServiceError as exc:
             logger.warning(
                 "Direct transcript path failed, trying yt-dlp fallback: video_id=%s language=%s error=%s cause=%s upstream_status=%s",
@@ -379,6 +381,17 @@ class TranscriptService:
     ) -> TranscriptResponse:
         try:
             transcript = self._extract_transcript_direct(video_id, language)
+        except TranscriptsDisabled as exc:
+            logger.info(
+                "Direct transcript unavailable: video_id=%s language=%s reason=transcripts_disabled",
+                video_id,
+                language,
+            )
+            raise TranscriptUnavailableError(
+                "Subtitles are disabled for this video",
+                cause=str(exc),
+                upstream_status=404,
+            ) from exc
         except NoTranscriptFound as exc:
             logger.info(
                 "Direct transcript language match not found: video_id=%s language=%s available=%s",
@@ -391,11 +404,24 @@ class TranscriptService:
                 cause=str(exc),
                 upstream_status=404,
             ) from exc
+        except VideoUnavailable as exc:
+            logger.info(
+                "Direct transcript unavailable: video_id=%s language=%s reason=video_unavailable",
+                video_id,
+                language,
+            )
+            raise TranscriptNotFoundError(
+                "Video is unavailable",
+                cause=str(exc),
+                upstream_status=404,
+            ) from exc
         except TranscriptNotFoundError:
+            raise
+        except TranscriptUnavailableError:
             raise
         except Exception as exc:
             logger.exception(
-                "Direct transcript extraction raised an exception: video_id=%s language=%s",
+                "Direct transcript extraction failed unexpectedly: video_id=%s language=%s",
                 video_id,
                 language,
             )
@@ -617,7 +643,7 @@ class TranscriptService:
         text = text.replace("\r", " ").replace("\n", " ")
         text = re.sub(r"\s+", " ", text)
         text = re.sub(
-            r"\[(music|applause|laughter|cheering)\]",
+            r"\[(music|applause|laughter|cheering)]",
             " ",
             text,
             flags=re.IGNORECASE,
