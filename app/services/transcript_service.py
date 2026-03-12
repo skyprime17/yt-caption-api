@@ -387,7 +387,7 @@ class TranscriptService:
                 video_id,
                 language,
             )
-            raise TranscriptUnavailableError(
+            raise TranscriptNotFoundError(
                 "Subtitles are disabled for this video",
                 cause=str(exc),
                 upstream_status=404,
