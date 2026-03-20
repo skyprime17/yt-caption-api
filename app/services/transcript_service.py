@@ -346,30 +346,34 @@ class TranscriptService:
         normalized_preferred = preferred_language.lower()
         preferred_prefix = normalized_preferred.split("-")[0]
 
-        def sort_key(transcript) -> tuple[int, int]:
+        def language_rank(transcript) -> int:
             language_code = transcript.language_code.lower()
             language_prefix = language_code.split("-")[0]
 
             if language_code == normalized_preferred:
-                language_rank = 0
-            elif language_prefix == preferred_prefix:
-                language_rank = 1
-            else:
-                language_rank = 2
+                return 0
+            if language_prefix == preferred_prefix:
+                return 1
+            return 2
 
+        def sort_key(transcript) -> tuple[int, int]:
             generated_rank = 1 if transcript.is_generated else 0
-            return language_rank, generated_rank
+            return language_rank(transcript), generated_rank
 
-        sorted_transcripts = sorted(available_transcripts, key=sort_key)
-        best_match = sorted_transcripts[0]
-        if sort_key(best_match)[0] == 2:
-            raise TranscriptNotFoundError(
-                "No transcript found for the requested language",
-                cause=f"Requested={preferred_language}; available={[item.language_code for item in available_transcripts]}",
-                upstream_status=404,
-            )
+        requested_matches = [
+            transcript
+            for transcript in available_transcripts
+            if language_rank(transcript) < 2
+        ]
+        if requested_matches:
+            best_match = sorted(requested_matches, key=sort_key)[0]
+            return best_match.fetch()
 
-        return best_match.fetch()
+        manual = [item for item in available_transcripts if not item.is_generated]
+        if manual:
+            return manual[0].fetch()
+
+        return available_transcripts[0].fetch()
 
     def _extract_transcript_direct_payload(
             self,
