@@ -5,13 +5,13 @@ description = "Small API wrapper around yt-dlp for YouTube transcripts"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "curl-cffi>=0.10.0",
+    "curl-cffi>=0.15.0",
     "fastapi>=0.116.0",
     "pydantic>=2.11.0",
     "pydantic-settings>=2.10.0",
     "uvicorn>=0.35.0",
     "youtube-transcript-api>=1.2.4",
-    "yt-dlp>=2025.3.31",
+    "yt-dlp>=2026.7.4",
 ]
 
 [dependency-groups]
