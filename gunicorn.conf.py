@@ -11,14 +11,22 @@ def post_fork(server, worker):
     try:
         import logging
         from hyperdx.opentelemetry import configure_opentelemetry
+        from opentelemetry.sdk._logs import LoggingHandler
 
         log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
         log_level_num = getattr(logging, log_level_name, logging.INFO)
 
-        configure_opentelemetry()
-
         root_logger = logging.getLogger()
+        otel_handlers = [h for h in root_logger.handlers if isinstance(h, LoggingHandler)]
+        if not otel_handlers:
+            configure_opentelemetry()
+
         root_logger.setLevel(log_level_num)
+        otel_handlers = [h for h in root_logger.handlers if isinstance(h, LoggingHandler)]
+        if len(otel_handlers) > 1:
+            for duplicate in otel_handlers[1:]:
+                root_logger.removeHandler(duplicate)
+
         for handler in root_logger.handlers:
             handler.setLevel(log_level_num)
 

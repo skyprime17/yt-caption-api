@@ -11,8 +11,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_telemetry_initialized = False
+
+
 def init_telemetry(settings: Settings, app: FastAPI) -> None:
     """Initializes HyperDX OpenTelemetry exporter, logging handler, and FastAPI instrumentation."""
+    global _telemetry_initialized
+    if _telemetry_initialized:
+        return
+    _telemetry_initialized = True
+
     endpoint = settings.otel_exporter_otlp_endpoint or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
     api_key = settings.hyperdx_api_key or os.environ.get("HYPERDX_API_KEY")
 
@@ -30,18 +38,23 @@ def init_telemetry(settings: Settings, app: FastAPI) -> None:
         os.environ.setdefault("HYPERDX_ENABLE_ADVANCED_NETWORK_CAPTURE", "1")
 
     log_level_num = getattr(logging, settings.log_level.upper(), logging.INFO)
-    logging.getLogger().setLevel(log_level_num)
 
     try:
         from hyperdx.opentelemetry import configure_opentelemetry
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.sdk._logs import LoggingHandler
 
         configure_opentelemetry()
         FastAPIInstrumentor.instrument_app(app)
 
-        # Ensure root logger and OpenTelemetry log handlers receive logs down to log_level_num
+        # Deduplicate OpenTelemetry logging handlers to prevent duplicate logs
         root_logger = logging.getLogger()
         root_logger.setLevel(log_level_num)
+        otel_handlers = [h for h in root_logger.handlers if isinstance(h, LoggingHandler)]
+        if len(otel_handlers) > 1:
+            for duplicate in otel_handlers[1:]:
+                root_logger.removeHandler(duplicate)
+
         for handler in root_logger.handlers:
             handler.setLevel(log_level_num)
 
