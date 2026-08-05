@@ -22,8 +22,14 @@ uv sync
 
 ## Run
 
+Development:
 ```powershell
-uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Production (Gunicorn + UvicornWorker with OpenTelemetry post_fork):
+```bash
+uv run gunicorn -c gunicorn.conf.py app.main:app
 ```
 
 ## Deployment
@@ -100,3 +106,21 @@ curl.exe "http://127.0.0.1:8000/transcript/dQw4w9WgXcQ?language=en&max_chars=500
 - You can bypass cache with `?use_cache=false`.
 - Responses include `X-Cache: HIT` or `X-Cache: MISS`.
 - `json3` caption tracks are converted into plain text. Other track types are returned as raw text.
+
+## Observability (ClickStack / OpenTelemetry)
+
+To send logs, traces, and metrics to ClickStack:
+
+1. Configure environment variables in `.env` or systemd:
+   ```env
+   OTEL_SERVICE_NAME=yt-caption-api
+   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+   HYPERDX_API_KEY=a25f83f4-31b1-437d-9ea0-8f1a1d4a1b58
+   ```
+
+2. Optional flags:
+   - `HYPERDX_ENABLE_ADVANCED_NETWORK_CAPTURE=1` to log HTTP request/response headers & body payloads.
+
+3. **Multi-worker / Gunicorn Note**:
+   If deploying with Gunicorn multi-workers (`-k uvicorn.workers.UvicornWorker`), use the `post_fork` hook provided in `deploy/gunicorn/gunicorn.conf.py.example`.
+

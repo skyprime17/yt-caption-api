@@ -12,6 +12,7 @@ from app.config import Settings, get_settings
 from app.routers.transcript import router as transcript_router
 from app.services.cache_service import CacheService
 from app.services.transcript_service import TranscriptService
+from app.telemetry import init_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=app_settings.app_version,
         lifespan=create_lifespan(app_settings),
     )
+    init_telemetry(app_settings, app)
     app.include_router(transcript_router)
     return app
 

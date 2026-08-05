@@ -8,7 +8,10 @@ Type=simple
 User=user
 WorkingDirectory=/home/user/yt-caption-api
 Environment=PATH=/home/user/.nvm/versions/node/v22.19.0/bin/node:/home/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin
-ExecStart=/home/user/.local/bin/uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+Environment="OTEL_SERVICE_NAME=yt-caption-api"
+Environment="OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318"
+Environment="HYPERDX_API_KEY=XX"
+ExecStart=/home/user/.local/bin/uv run gunicorn -c gunicorn.conf.py app.main:app
 Restart=always
 RestartSec=5
 

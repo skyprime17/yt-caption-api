@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     curl_impersonate: str = "chrome"
     resolve_url_timeout_seconds: int = 20
     caption_fetch_timeout_seconds: int = 30
+    otel_service_name: str = "yt-caption-api"
+    otel_exporter_otlp_endpoint: str | None = None
+    hyperdx_api_key: str | None = None
+    hyperdx_enable_advanced_network_capture: bool = False
 
 
 @lru_cache
