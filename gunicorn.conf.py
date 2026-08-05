@@ -1,7 +1,7 @@
 import os
 
 bind = os.environ.get("BIND", "0.0.0.0:8000")
-workers = int(os.environ.get("WORKERS", "2"))
+workers = int(os.environ.get("WORKERS", "1"))
 worker_class = "uvicorn.workers.UvicornWorker"
 timeout = 60
 
